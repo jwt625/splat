@@ -334,6 +334,9 @@ function translate4(a, x, y, z) {
 function createWorker(self) {
     let buffer;
     let vertexCount = 0;
+    // We’ll detect full l<=3 SH (3 DC + 45 rest = 48 floats) in PLY
+    let hasSH = false;
+    let shBuffer = null;
     let viewProj;
     // 6*4 + 4 + 4 = 8*4
     // XYZ - Position (Float32)
@@ -564,6 +567,13 @@ function createWorker(self) {
         }
         console.log("Bytes per row", row_offset, types, offsets);
 
+        // Detect if SH fields exist
+        hasSH = types["f_dc_0"] !== undefined && types["f_rest_0"] !== undefined;
+        if (hasSH) {
+            // allocate a Float32 per vertex * 48
+            shBuffer = new Float32Array(vertexCount * 48);
+        }
+
         let dataView = new DataView(
             inputBuffer,
             header_end_index + header_end.length,
@@ -601,6 +611,8 @@ function createWorker(self) {
         sizeIndex.sort((b, a) => sizeList[a] - sizeList[b]);
         console.timeEnd("sort");
 
+
+        
         // 6*4 + 4 + 4 = 8*4
         // XYZ - Position (Float32)
         // XYZ - Scale (Float32)
@@ -672,9 +684,29 @@ function createWorker(self) {
             } else {
                 rgba[3] = 255;
             }
+
+            // Populate SH floats if present
+            if (hasSH) {
+                const base = j * 48;
+                // channel R
+                shBuffer[base + 0] = attrs.f_dc_0;
+                for (let k = 0; k < 15; ++k) {
+                    shBuffer[base + 1 + k] = attrs[`f_rest_${k}`];
+                }
+                // channel G
+                shBuffer[base + 16 + 0] = attrs.f_dc_1;
+                for (let k = 0; k < 15; ++k) {
+                    shBuffer[base + 17 + k] = attrs[`f_rest_${15 + k}`];
+                }
+                // channel B
+                shBuffer[base + 32 + 0] = attrs.f_dc_2;
+                for (let k = 0; k < 15; ++k) {
+                    shBuffer[base + 33 + k] = attrs[`f_rest_${30 + k}`];
+                }
+            }
         }
         console.timeEnd("build buffer");
-        return buffer;
+        return  { buffer: buffer, shBuffer: shBuffer };
     }
 
     /**
@@ -697,11 +729,27 @@ function createWorker(self) {
     let sortRunning;
     self.onmessage = (e) => {
         if (e.data.ply) {
-            vertexCount = 0;
-            runSort(viewProj);
-            buffer = processPlyBuffer(e.data.ply);
+            const { buffer: splatBuf, shBuffer: sb } = processPlyBuffer(e.data.ply);
+            buffer = splatBuf;
             vertexCount = Math.floor(buffer.byteLength / rowLength);
-            postMessage({ buffer: buffer, save: !!e.data.save });
+
+            // Send the splat buffer (for saving or sorting) - clone it to avoid detachment
+            self.postMessage({ buffer: buffer.slice(), save: !!e.data.save });
+
+            // If we have SH floats, send them too (but check size limits)
+            if (sb) {
+                const shTexW = 1024;
+                const shTexH = Math.ceil((vertexCount * 48) / shTexW);
+
+                // Check if texture would be too large (most GPUs support max 16384)
+                if (shTexH <= 8192) {
+                    self.postMessage(
+                        { shBuffer: sb.slice(), shTexW, shTexH }
+                    );
+                } else {
+                    console.warn(`SH texture too large: ${shTexW}x${shTexH}, skipping SH data`);
+                }
+            }
         } else if (e.data.buffer) {
             buffer = e.data.buffer;
             vertexCount = e.data.vertexCount;
@@ -725,7 +773,7 @@ uniform vec2 focal;
 uniform vec2 viewport;
 
 in vec2 position;
-in int index;
+in int  index;
 
 out vec4 vColor;
 out vec2 vPosition;
@@ -736,7 +784,8 @@ void main () {
     vec4 pos2d = projection * cam;
 
     float clip = 1.2 * pos2d.w;
-    if (pos2d.z < -clip || pos2d.x < -clip || pos2d.x > clip || pos2d.y < -clip || pos2d.y > clip) {
+    if (pos2d.z < -clip || pos2d.x < -clip ||
+        pos2d.x >  clip || pos2d.y < -clip || pos2d.y > clip) {
         gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
         return;
     }
@@ -746,9 +795,9 @@ void main () {
     mat3 Vrk = mat3(u1.x, u1.y, u2.x, u1.y, u2.y, u3.x, u2.x, u3.x, u3.y);
 
     mat3 J = mat3(
-        focal.x / cam.z, 0., -(focal.x * cam.x) / (cam.z * cam.z),
-        0., -focal.y / cam.z, (focal.y * cam.y) / (cam.z * cam.z),
-        0., 0., 0.
+        focal.x / cam.z,            0.0, -(focal.x * cam.x) / (cam.z * cam.z),
+                  0.0, -focal.y / cam.z,  (focal.y * cam.y) / (cam.z * cam.z),
+                  0.0,            0.0,                         0.0
     );
 
     mat3 T = transpose(mat3(view)) * J;
@@ -758,10 +807,9 @@ void main () {
     float radius = length(vec2((cov2d[0][0] - cov2d[1][1]) / 2.0, cov2d[0][1]));
     float lambda1 = mid + radius, lambda2 = mid - radius;
 
-    if(lambda2 < 0.0) return;
-    vec2 diagonalVector = normalize(vec2(cov2d[0][1], lambda1 - cov2d[0][0]));
-    vec2 majorAxis = min(sqrt(2.0 * lambda1), 1024.0) * diagonalVector;
-    vec2 minorAxis = min(sqrt(2.0 * lambda2), 1024.0) * vec2(diagonalVector.y, -diagonalVector.x);
+    vec2 diag     = normalize(vec2(cov2d[0][1], lambda1 - cov2d[0][0]));
+    vec2 majorAxis = min(sqrt(2.0 * lambda1), 1024.0) * diag;
+    vec2 minorAxis = min(sqrt(2.0 * lambda2), 1024.0) * vec2(diag.y, -diag.x);
 
     vColor = clamp(pos2d.z/pos2d.w+1.0, 0.0, 1.0) * vec4((cov.w) & 0xffu, (cov.w >> 8) & 0xffu, (cov.w >> 16) & 0xffu, (cov.w >> 24) & 0xffu) / 255.0;
     vPosition = position;
@@ -874,6 +922,25 @@ async function main() {
 
     gl.disable(gl.DEPTH_TEST); // Disable depth testing
 
+    // Check for required WebGL extensions
+    const ext = gl.getExtension('EXT_color_buffer_float');
+    if (!ext) {
+        console.warn('EXT_color_buffer_float not supported, SH textures may not work');
+    }
+
+    // --- NEW: Create & bind RGBA32F texture unit 1 for SH ---
+    const shTex = gl.createTexture();
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, shTex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.useProgram(program);
+    gl.uniform1i(gl.getUniformLocation(program, "u_shCoeffs"), 1);
+
+
+
     // Enable blending
     gl.enable(gl.BLEND);
     gl.blendFuncSeparate(
@@ -980,7 +1047,23 @@ async function main() {
             );
             gl.activeTexture(gl.TEXTURE0);
             gl.bindTexture(gl.TEXTURE_2D, texture);
-        } else if (e.data.depthIndex) {
+        } 
+        else if (e.data.shBuffer) {
+            const { shBuffer, shTexW, shTexH } = e.data;
+            gl.activeTexture(gl.TEXTURE1);
+            try {
+                gl.texImage2D(
+                    gl.TEXTURE_2D, 0, gl.RGBA32F,
+                    shTexW, shTexH, 0,
+                    gl.RGBA, gl.FLOAT,
+                    shBuffer
+                );
+                console.log(`SH texture uploaded: ${shTexW}x${shTexH}`);
+            } catch (err) {
+                console.warn('Failed to upload SH texture:', err);
+            }
+        }
+        else if (e.data.depthIndex) {
             const { depthIndex, viewProj } = e.data;
             gl.bindBuffer(gl.ARRAY_BUFFER, indexBuffer);
             gl.bufferData(gl.ARRAY_BUFFER, depthIndex, gl.DYNAMIC_DRAW);

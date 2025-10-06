@@ -807,6 +807,7 @@ void main () {
     float radius = length(vec2((cov2d[0][0] - cov2d[1][1]) / 2.0, cov2d[0][1]));
     float lambda1 = mid + radius, lambda2 = mid - radius;
 
+    if(lambda2 < 0.0) return;
     vec2 diag     = normalize(vec2(cov2d[0][1], lambda1 - cov2d[0][0]));
     vec2 majorAxis = min(sqrt(2.0 * lambda1), 1024.0) * diag;
     vec2 minorAxis = min(sqrt(2.0 * lambda2), 1024.0) * vec2(diag.y, -diag.x);
